@@ -21,11 +21,12 @@ class BatchRangeIterator<K, Param : Any>(
 ) : AbstractIterator<GetNextBatchRangeResponse.Batch>() {
 
   private val timeElapsed: () -> Boolean
-  private var nextKeyRange: Lazy<OpenKeyRange<K>>
+  private var nextKeyRange: OpenKeyRange<K>
+  private var pendingWindow: PendingWindow<K>? = null
   init {
     timeElapsed =
       if (request.compute_time_limit_ms == null) { { false } } else timer(request.compute_time_limit_ms)
-    nextKeyRange = lazy { OpenKeyRange.initialRangeFor(jooqBackfill, request, session) }
+    nextKeyRange = OpenKeyRange.initialRangeFor(jooqBackfill, request, session)
   }
 
   private fun timer(timeLimitMs: Long): () -> Boolean {
@@ -35,16 +36,20 @@ class BatchRangeIterator<K, Param : Any>(
 
   override fun computeNext(): GetNextBatchRangeResponse.Batch? {
     if (timeElapsed() || request.backfill_range.start == null) return endOfData()
-    val keyRange = nextKeyRange.value
+    pendingWindow?.let {
+      nextKeyRange = OpenKeyRange.nextRangeFor(jooqBackfill, request, session, it.start)
+      pendingWindow = null
+    }
+    val keyRange = nextKeyRange
     val keyValues = selectKeyValues(keyRange)
     val end = keyRange.determineEnd(keyValues, request)
     val scannedCount = determineScannedCount(keyRange, end)
     if (scannedCount == 0) return endOfData()
     val start = keyRange.determineStart(session)
-    nextKeyRange = if (keyRange.endsAtUpperBound(end)) {
-      lazy { OpenKeyRange.nextRangeFor(jooqBackfill, request, session, end) }
+    if (keyRange.endsAtUpperBound(end)) {
+      pendingWindow = PendingWindow(end)
     } else {
-      lazyOf(keyRange.nextRangeFor(end))
+      nextKeyRange = keyRange.nextRangeFor(end)
     }
     return GetNextBatchRangeResponse.Batch.Builder()
       .batch_range(jooqBackfill.buildKeyRange(start, end))
@@ -78,3 +83,5 @@ class BatchRangeIterator<K, Param : Any>(
       ?: throw IllegalStateException("A SQL count will always return back a row")
   }
 }
+
+private class PendingWindow<K>(val start: K)
