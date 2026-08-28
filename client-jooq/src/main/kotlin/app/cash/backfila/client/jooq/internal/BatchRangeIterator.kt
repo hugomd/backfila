@@ -37,10 +37,10 @@ class BatchRangeIterator<K, Param : Any>(
     if (timeElapsed() || request.backfill_range.start == null) return endOfData()
     val keyRange = nextKeyRange.value
     val keyValues = selectKeyValues(keyRange)
-    val start = keyRange.determineStart(session)
     val end = keyRange.determineEnd(keyValues, request)
     val scannedCount = determineScannedCount(keyRange, end)
     if (scannedCount == 0) return endOfData()
+    val start = keyRange.determineStart(session)
     nextKeyRange = if (keyRange.endsAtUpperBound(end)) {
       lazy { OpenKeyRange.nextRangeFor(jooqBackfill, request, session, end) }
     } else {

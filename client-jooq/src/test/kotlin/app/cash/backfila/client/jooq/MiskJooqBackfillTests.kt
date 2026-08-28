@@ -194,7 +194,7 @@ class MiskJooqBackfillTests {
 
   @Test
   fun sparseMatchesStayWithinRawScanWindows() {
-    val matchingPositions = listOf(0, 3, 8, 11)
+    val matchingPositions = listOf(0, 1, 8, 11)
     val rawKeys = transacter.transaction("sparseMatchesStayWithinRawScanWindows") { session ->
       (0 until 12).map { position ->
         session.newRecord(MENU)
@@ -220,12 +220,14 @@ class MiskJooqBackfillTests {
 
     val batches = run.singleScan().batches
 
-    assertThat(batches).hasSize(3)
+    assertThat(batches).hasSize(4)
     assertThat(batches).allMatch { it.scanned_record_count <= run.scanSize }
-    assertThat(batches.map { it.scanned_record_count }).containsExactly(4L, 4L, 4L)
-    assertThat(batches.map { it.matching_record_count }).containsExactly(2L, 0L, 2L)
-    assertThat(batches[1].batch_range.start.utf8()).isEqualTo(rawKeys[4].toString())
-    assertThat(batches[1].batch_range.end.utf8()).isEqualTo(rawKeys[7].toString())
+    assertThat(batches.map { it.scanned_record_count }).containsExactly(2L, 2L, 4L, 4L)
+    assertThat(batches.map { it.matching_record_count }).containsExactly(2L, 0L, 0L, 2L)
+    assertThat(batches[1].batch_range.start.utf8()).isEqualTo(rawKeys[2].toString())
+    assertThat(batches[1].batch_range.end.utf8()).isEqualTo(rawKeys[3].toString())
+    assertThat(batches[2].batch_range.start.utf8()).isEqualTo(rawKeys[4].toString())
+    assertThat(batches[2].batch_range.end.utf8()).isEqualTo(rawKeys[7].toString())
 
     run.scanRemaining()
     run.runAllScanned()
