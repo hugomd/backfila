@@ -21,11 +21,11 @@ class BatchRangeIterator<K, Param : Any>(
 ) : AbstractIterator<GetNextBatchRangeResponse.Batch>() {
 
   private val timeElapsed: () -> Boolean
-  private var nextKeyRange: OpenKeyRange<K>
+  private var nextKeyRange: Lazy<OpenKeyRange<K>>
   init {
     timeElapsed =
       if (request.compute_time_limit_ms == null) { { false } } else timer(request.compute_time_limit_ms)
-    nextKeyRange = OpenKeyRange.initialRangeFor(jooqBackfill, request, session)
+    nextKeyRange = lazy { OpenKeyRange.initialRangeFor(jooqBackfill, request, session) }
   }
 
   private fun timer(timeLimitMs: Long): () -> Boolean {
@@ -35,13 +35,17 @@ class BatchRangeIterator<K, Param : Any>(
 
   override fun computeNext(): GetNextBatchRangeResponse.Batch? {
     if (timeElapsed() || request.backfill_range.start == null) return endOfData()
-    val keyRange = nextKeyRange
+    val keyRange = nextKeyRange.value
     val keyValues = selectKeyValues(keyRange)
-    val start = keyRange.determineStart(keyValues)
-    val end = keyRange.determineEnd(keyValues)
+    val start = keyRange.determineStart(session)
+    val end = keyRange.determineEnd(keyValues, request)
     val scannedCount = determineScannedCount(keyRange, end)
     if (scannedCount == 0) return endOfData()
-    nextKeyRange = keyRange.nextRangeFor(end)
+    nextKeyRange = if (keyRange.endsAtUpperBound(end)) {
+      lazy { OpenKeyRange.nextRangeFor(jooqBackfill, request, session, end) }
+    } else {
+      lazyOf(keyRange.nextRangeFor(end))
+    }
     return GetNextBatchRangeResponse.Batch.Builder()
       .batch_range(jooqBackfill.buildKeyRange(start, end))
       .scanned_record_count(scannedCount.toLong())

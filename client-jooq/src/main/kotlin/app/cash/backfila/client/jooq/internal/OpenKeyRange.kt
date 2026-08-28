@@ -7,7 +7,6 @@ import app.cash.backfila.protos.clientservice.GetNextBatchRangeRequest
 import org.jooq.Condition
 import org.jooq.DSLContext
 import org.jooq.Record
-import org.jooq.impl.DSL.select
 
 data class OpenKeyRange<K>(
   private val jooqBackfill: JooqBackfill<K, *>,
@@ -22,7 +21,7 @@ data class OpenKeyRange<K>(
    */
   private val start: K,
   /**
-   * The overall upper bound of the range.
+   * The upper bound of the current raw scan window.
    */
   private val upperBound: K,
 ) {
@@ -33,9 +32,33 @@ data class OpenKeyRange<K>(
   fun determineEnd(keyValues: List<K>): K =
     keyValues.lastOrNull() ?: upperBound
 
+  internal fun determineStart(session: DSLContext): K {
+    return session.select(jooqBackfill.compoundKeyFields)
+      .from(jooqBackfill.table)
+      .where(betweenStartAndUpperBoundCondition())
+      .orderBy(jooqBackfill.sortingByCompoundKeyFields { it.asc() })
+      .limit(1)
+      .fetchOne { jooqBackfill.recordToKey(it) }
+      ?: start
+  }
+
+  internal fun determineEnd(
+    keyValues: List<K>,
+    request: GetNextBatchRangeRequest,
+  ): K {
+    return if (request.precomputing == true || keyValues.size.toLong() < request.batch_size) {
+      upperBound
+    } else {
+      keyValues.last()
+    }
+  }
+
+  internal fun endsAtUpperBound(end: K): Boolean =
+    jooqBackfill.toByteString(end) == jooqBackfill.toByteString(upperBound)
+
   /**
-   * Builds a jooq condition that limits a query to the start of the range and the overall upper
-   * bound.
+   * Builds a jooq condition that limits a query to the start of the range and the current raw scan
+   * window's upper bound.
    */
   fun betweenStartAndUpperBoundCondition(): Condition {
     return jooqBackfill.compareCompoundKey(start, startComparison)
@@ -102,15 +125,57 @@ data class OpenKeyRange<K>(
           jooqBackfill.fromByteString(request.previous_end_key)
         } ?: jooqBackfill.fromByteString(request.backfill_range.start)
 
-      return OpenKeyRange(
+      return rangeFor(
         jooqBackfill = jooqBackfill,
+        request = request,
+        session = session,
         start = start,
         startComparison = startComparison,
-        upperBound = computeUpperBound(
-          jooqBackfill, request, session,
-          jooqBackfill.compareCompoundKey(start, startComparison),
-        ),
       )
+    }
+
+    internal fun <K> nextRangeFor(
+      jooqBackfill: JooqBackfill<K, *>,
+      request: GetNextBatchRangeRequest,
+      session: DSLContext,
+      start: K,
+    ): OpenKeyRange<K> {
+      return rangeFor(
+        jooqBackfill = jooqBackfill,
+        request = request,
+        session = session,
+        start = start,
+        startComparison = { keyComparer, compoundKeyValue ->
+          keyComparer.gt(compoundKeyValue)
+        },
+      )
+    }
+
+    private fun <K> rangeFor(
+      jooqBackfill: JooqBackfill<K, *>,
+      request: GetNextBatchRangeRequest,
+      session: DSLContext,
+      start: K,
+      startComparison: CompoundKeyComparisonOperator<K>,
+    ): OpenKeyRange<K> {
+      val upperBound = computeUpperBound(
+        jooqBackfill = jooqBackfill,
+        request = request,
+        session = session,
+        afterPrecedingRowsCondition = jooqBackfill.compareCompoundKey(start, startComparison),
+      )
+      return if (upperBound != null) {
+        OpenKeyRange(jooqBackfill, startComparison, start, upperBound)
+      } else {
+        OpenKeyRange(
+          jooqBackfill = jooqBackfill,
+          startComparison = { keyComparer, compoundKeyValue ->
+            keyComparer.gt(compoundKeyValue)
+          },
+          start = start,
+          upperBound = start,
+        )
+      }
     }
 
     /**
@@ -136,27 +201,33 @@ data class OpenKeyRange<K>(
       jooqBackfill: JooqBackfill<K, *>,
       request: GetNextBatchRangeRequest,
       session: DSLContext,
-      afterPreceedingRowsCondition: Condition,
-    ): K {
-      return if (request.backfill_range != null && request.backfill_range.end != null) {
-        jooqBackfill.fromByteString(request.backfill_range.end)
-      } else {
-        session
-          .select(jooqBackfill.compoundKeyFields)
-          .from(
-            select(jooqBackfill.compoundKeyFields)
-              .from(jooqBackfill.table)
-              .where(afterPreceedingRowsCondition)
-              .orderBy(jooqBackfill.sortingByCompoundKeyFields { it.asc() })
-              .limit(request.scan_size),
-          )
-          .orderBy(jooqBackfill.sortingByCompoundKeyFields { it.desc() })
-          .limit(1)
-          .fetchOne { jooqBackfill.recordToKey(it) }
-          ?: throw IllegalStateException(
-            "Expecting a row when calculating the upper bound",
-          )
+      afterPrecedingRowsCondition: Condition,
+    ): K? {
+      val overallEnd = request.backfill_range?.end?.let(jooqBackfill::fromByteString)
+      val boundedCondition = overallEnd?.let {
+        afterPrecedingRowsCondition.and(
+          jooqBackfill.compareCompoundKey(it) { keyCompare, compoundKeyValue ->
+            keyCompare.lte(compoundKeyValue)
+          },
+        )
+      } ?: afterPrecedingRowsCondition
+      val scanWindow = session
+        .select(jooqBackfill.compoundKeyFields)
+        .from(jooqBackfill.table)
+        .where(boundedCondition)
+        .orderBy(jooqBackfill.sortingByCompoundKeyFields { it.asc() })
+        .limit(request.scan_size)
+        .asTable("scan_window")
+      val scanWindowFields = jooqBackfill.compoundKeyFields.map { field ->
+        checkNotNull(scanWindow.field(field))
       }
+
+      return session
+        .select(scanWindowFields)
+        .from(scanWindow)
+        .orderBy(scanWindowFields.map { it.desc() })
+        .limit(1)
+        .fetchOne { jooqBackfill.recordToKey(it) }
     }
   }
 }
