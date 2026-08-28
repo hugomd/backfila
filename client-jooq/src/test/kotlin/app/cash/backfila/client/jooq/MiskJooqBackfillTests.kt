@@ -5,6 +5,7 @@ import app.cash.backfila.client.jooq.config.IdRecorder
 import app.cash.backfila.client.jooq.config.JooqDBIdentifier
 import app.cash.backfila.client.jooq.config.JooqMenuTestBackfill
 import app.cash.backfila.client.jooq.config.JooqTransacter
+import app.cash.backfila.client.jooq.gen.tables.references.MENU
 import app.cash.backfila.client.testing.assertThat as testingAssertThat
 import app.cash.backfila.embedded.Backfila
 import app.cash.backfila.embedded.BackfillRun
@@ -189,6 +190,47 @@ class MiskJooqBackfillTests {
     testingAssertThat(run).isComplete()
     assertThat(run.backfill.idsRanDry).containsExactlyElementsOf(backfillRowKeys)
     assertThat(run.backfill.idsRanWet).isEmpty()
+  }
+
+  @Test
+  fun sparseMatchesStayWithinRawScanWindows() {
+    val matchingPositions = listOf(0, 3, 8, 11)
+    val rawKeys = transacter.transaction("sparseMatchesStayWithinRawScanWindows") { session ->
+      (0 until 12).map { position ->
+        session.newRecord(MENU)
+          .apply {
+            name = if (position in matchingPositions) "chicken" else "beef"
+          }.let {
+            it.store()
+            it.id!!
+          }
+      }
+    }
+    val expectedMatchingKeys = matchingPositions.map(rawKeys::get)
+    val run = backfila.createDryRun(
+      JooqMenuTestBackfill::class,
+      emptyMap(),
+      null,
+      null,
+    ).apply {
+      batchSize = 2
+      scanSize = 4
+      computeCountLimit = 10
+    }
+
+    val batches = run.singleScan().batches
+
+    assertThat(batches).hasSize(3)
+    assertThat(batches).allMatch { it.scanned_record_count <= run.scanSize }
+    assertThat(batches.map { it.scanned_record_count }).containsExactly(4L, 4L, 4L)
+    assertThat(batches.map { it.matching_record_count }).containsExactly(2L, 0L, 2L)
+    assertThat(batches[1].batch_range.start.utf8()).isEqualTo(rawKeys[4].toString())
+    assertThat(batches[1].batch_range.end.utf8()).isEqualTo(rawKeys[7].toString())
+
+    run.scanRemaining()
+    run.runAllScanned()
+
+    assertThat(run.backfill.idsRanDry).containsExactlyElementsOf(expectedMatchingKeys)
   }
 
   @ParameterizedTest(name = "precomputingIgnoresBatchSize test - {0}")
