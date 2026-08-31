@@ -225,10 +225,14 @@ class MiskJooqBackfillTests {
 
     assertThat(batches).hasSize(4)
     assertThat(batches).allMatch { it.scanned_record_count <= run.scanSize }
+    // Batches: [0..1] full match, [2..3] empty tail, [4..7] empty window, and
+    // [8..11] sparse full match.
     assertThat(batches.map { it.scanned_record_count }).containsExactly(2L, 2L, 4L, 4L)
     assertThat(batches.map { it.matching_record_count }).containsExactly(2L, 0L, 0L, 2L)
+    // The first window's empty tail starts after the preceding matching batch.
     assertThat(batches[1].batch_range.start.utf8()).isEqualTo(rawKeys[2].toString())
     assertThat(batches[1].batch_range.end.utf8()).isEqualTo(rawKeys[3].toString())
+    // The entirely empty second window still advances the raw cursor.
     assertThat(batches[2].batch_range.start.utf8()).isEqualTo(rawKeys[4].toString())
     assertThat(batches[2].batch_range.end.utf8()).isEqualTo(rawKeys[7].toString())
 
